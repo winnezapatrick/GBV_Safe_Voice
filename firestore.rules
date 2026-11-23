@@ -1,0 +1,158 @@
+rules_version = '2';
+
+// Safe Voice - Firestore Security Rules (v3, final workflow)
+// Roles: reporter (anonymous sign-in), officer (approved), admin (approved + role admin).
+// Anything not matched below is denied.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+    function officerPath(uid) {
+      return /databases/$(database)/documents/officers/$(uid);
+    }
+    function isApprovedUid(uid) {
+      return exists(officerPath(uid)) && get(officerPath(uid)).data.status == 'approved';
+    }
+    function isApprovedOfficer() {
+      return signedIn() && isApprovedUid(request.auth.uid);
+    }
+    function isAdmin() {
+      return isApprovedOfficer() && get(officerPath(request.auth.uid)).data.role == 'admin';
+    }
+    // Allowed status moves for the ASSIGNED officer. (Admin only assigns/reassigns.)
+    function validTransition(from, to) {
+      return (from == 'Assigned' && to == 'Open')
+          || (from == 'Open' && to == 'Resolved')
+          || ((from == 'Open' || from == 'Resolved') && to == 'Closed');
+    }
+
+    // ---------- officers ----------
+    match /officers/{uid} {
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.auth.token.firebase.sign_in_provider == 'password'
+        && request.resource.data.keys().hasOnly(['name', 'email', 'status', 'role', 'createdAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.role == 'officer'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.createdAt == request.time;
+
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      allow update: if isAdmin()
+        && request.auth.uid != uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && request.resource.data.status in ['pending', 'approved', 'disabled'];
+
+      allow delete: if false;
+    }
+
+    // ---------- reports ----------
+    match /reports/{ref} {
+
+      function incoming() {
+        return request.resource.data;
+      }
+      function optStr(k, max) {
+        return !(k in incoming()) || (incoming()[k] is string && incoming()[k].size() <= max);
+      }
+      function changed() {
+        return incoming().diff(resource.data).affectedKeys();
+      }
+
+      // Reporters create only. Create-only means an existing report can't be overwritten.
+      allow create: if signedIn()
+        && ref.matches('SV-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}')
+        && incoming().keys().hasOnly([
+             'reference', 'category', 'description', 'incidentDate', 'incidentTime',
+             'location', 'reportingFor', 'evidencePaths', 'status',
+             'assignedOfficerId', 'assignedOfficerName',
+             'submissionTimestamp', 'lastUpdatedAt'])
+        && incoming().keys().hasAll(
+             ['reference', 'category', 'description', 'status', 'submissionTimestamp', 'lastUpdatedAt'])
+        && incoming().reference == ref
+        && incoming().category is string
+        && incoming().category.size() > 0 && incoming().category.size() <= 100
+        && incoming().description is string
+        && incoming().description.size() > 0 && incoming().description.size() <= 5000
+        && optStr('incidentDate', 20)
+        && optStr('incidentTime', 20)
+        && optStr('location', 300)
+        && optStr('reportingFor', 50)
+        && incoming().status == 'Pending'
+        && incoming().get('assignedOfficerId', null) == null
+        && incoming().get('assignedOfficerName', null) == null
+        && incoming().submissionTimestamp == request.time
+        && incoming().lastUpdatedAt == request.time
+        && (!('evidencePaths' in incoming())
+            || (incoming().evidencePaths is list && incoming().evidencePaths.size() <= 5));
+
+      // Admins read every report. Officers read ONLY cases assigned to them (FR9).
+      // Officer queries must filter on assignedOfficerId == their uid.
+      allow read: if isAdmin()
+        || (isApprovedOfficer() && resource.data.assignedOfficerId == request.auth.uid);
+
+      allow update:
+        // Admin assigns or reassigns, only before work starts.
+        if (isAdmin()
+            && resource.data.status in ['Pending', 'Assigned']
+            && incoming().status == 'Assigned'
+            && changed().hasOnly(['assignedOfficerId', 'assignedOfficerName', 'assignedAt', 'status', 'lastUpdatedAt'])
+            && incoming().assignedOfficerId is string
+            && isApprovedUid(incoming().assignedOfficerId)
+            && incoming().assignedOfficerName is string
+            && incoming().assignedAt == request.time
+            && incoming().lastUpdatedAt == request.time)
+        // The assigned officer moves the case along. A Closed case is final.
+        || (isApprovedOfficer()
+            && resource.data.assignedOfficerId == request.auth.uid
+            && changed().hasOnly(['status', 'closureDate', 'lastUpdatedAt'])
+            && validTransition(resource.data.status, incoming().status)
+            && incoming().lastUpdatedAt == request.time
+            && (incoming().status == 'Closed'
+                ? incoming().closureDate == request.time
+                : !changed().hasAny(['closureDate'])));
+
+      allow delete: if false;
+    }
+
+    // ---------- case history (append-only) ----------
+    match /caseUpdates/{id} {
+      allow read: if isApprovedOfficer();
+      allow create: if isApprovedOfficer()
+        && request.resource.data.keys().hasOnly(
+             ['reference', 'type', 'status', 'assignedOfficerId', 'updatedBy', 'timestamp'])
+        && request.resource.data.keys().hasAll(['reference', 'status', 'updatedBy', 'timestamp'])
+        && request.resource.data.updatedBy == request.auth.uid
+        && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- case notes and referrals (append-only) ----------
+    match /caseNotes/{id} {
+      allow read: if isApprovedOfficer();
+      allow create: if isApprovedOfficer() && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
+    }
+    match /referrals/{id} {
+      allow read: if isApprovedOfficer();
+      allow create: if isApprovedOfficer() && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- audit log (admins read, staff append) ----------
+    match /auditLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isApprovedOfficer()
+        && request.resource.data.performedBy == request.auth.uid
+        && request.resource.data.timestamp == request.time;
+      allow update, delete: if false;
+    }
+  }
+}
